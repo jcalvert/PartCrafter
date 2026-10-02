@@ -76,6 +76,7 @@ def run_triposg(
     else:
         img_pil = Image.open(image_input)
     start_time = time.time()
+    print(f"[partcrafter] start at {start_time:.1f}", flush=True)
     outputs = pipe(
         image=[img_pil] * num_parts,
         attention_kwargs={"num_parts": num_parts},

@@ -316,6 +316,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
 
         # 7. decoder mesh
+        import time as _time
+        if latents.device.type == "mps":
+            torch.mps.synchronize()  # MPS is asynchronous: the denoising bar above only measures queueing
+        _t = _time.time()
+        print(f"[partcrafter] denoising done (synchronised) at {_t:.1f}", flush=True)
         self.vae.set_flash_decoder()
         output, meshes = [], []
         self.set_progress_bar_config(
@@ -346,6 +351,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     mesh_v_f = None
                     mesh = None
                 output.append(mesh_v_f)
+                print(f"[partcrafter] part {i} decoded in {_time.time() - _t:.1f}s", flush=True)
+                _t = _time.time()
                 meshes.append(mesh)
                 progress_bar.update()
        
