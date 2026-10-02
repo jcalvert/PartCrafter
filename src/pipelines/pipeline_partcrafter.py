@@ -116,6 +116,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         )
 
     @property
+    def dtype(self):
+        # The transformer can have its own precision; it must not set latent dtype.
+        return self.image_encoder_dinov2.dtype
+
+    @property
     def guidance_scale(self):
         return self._guidance_scale
 
@@ -227,7 +232,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             raise ValueError("Invalid input type for image")
 
         device = self._execution_device
-        dtype = self.image_encoder_dinov2.dtype
+        dtype = self.dtype
+        transformer_dtype = self.transformer.dtype
 
         # 3. Encode condition
         image_embeds, negative_image_embeds = self.encode_image(
@@ -252,7 +258,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             batch_size * num_images_per_prompt,
             num_tokens,
             num_channels_latents,
-            image_embeds.dtype,
+            dtype,
             device,
             generator,
             latents,
@@ -279,12 +285,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 timestep = t.expand(latent_model_input.shape[0])
 
                 noise_pred = self.transformer(
-                    latent_model_input,
+                    latent_model_input.to(dtype=transformer_dtype),
                     timestep,
-                    encoder_hidden_states=image_embeds,
+                    encoder_hidden_states=image_embeds.to(dtype=transformer_dtype),
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
-                )[0].to(dtype)
+                )[0].float()
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -300,9 +306,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 )[0]
 
                 if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                        latents = latents.to(latents_dtype)
+                    latents = latents.to(latents_dtype)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

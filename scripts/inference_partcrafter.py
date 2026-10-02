@@ -138,6 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_alpha", action="store_true", help="input is RGBA (or --mask given): crop/pad by its alpha, no RMBG")
     parser.add_argument("--device", type=str, default=None, help="cuda, mps or cpu (default: auto)")
     parser.add_argument("--dtype", type=str, default=None, choices=["float16", "float32", "bfloat16"], help="default: float16 on cuda, float32 elsewhere")
+    parser.add_argument("--dit_dtype", choices=["float32", "float16", "bfloat16"], default=None,
+                        help="transformer-only precision (default: same as --dtype); --dtype float32 recommended")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--part_suggest", action="store_true", help="use VLM to suggest num_parts automatically")
     parser.add_argument("--style_transfer", action="store_true", help="apply Objaverse-style transfer to input image")
@@ -148,7 +150,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = get_device(args.device)
     dtype = getattr(torch, args.dtype) if args.dtype else (torch.float16 if device == "cuda" else torch.float32)
-    print(f"device={device} dtype={dtype}")
+    dit_dtype = getattr(torch, args.dit_dtype) if args.dit_dtype else dtype
+    print(f"device={device} dtype={dtype} dit_dtype={dit_dtype}")
 
     if args.num_parts is not None:
         assert 1 <= args.num_parts <= MAX_NUM_PARTS, f"num_parts must be in [1, {MAX_NUM_PARTS}]"
@@ -169,6 +172,7 @@ if __name__ == "__main__":
 
     # init tripoSG pipeline
     pipe: PartCrafterPipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir).to(device, dtype)
+    pipe.transformer.to(dtype=dit_dtype)
 
     set_seed(args.seed)
 
@@ -261,6 +265,7 @@ if __name__ == "__main__":
         "composite_file": "object.glb",
         "device": device,
         "dtype": str(dtype),
+        "dit_dtype": str(dit_dtype),
         "num_inference_steps": args.num_inference_steps,
         "dense_octree_depth": args.dense_octree_depth,
         "hierarchical_octree_depth": args.hierarchical_octree_depth,

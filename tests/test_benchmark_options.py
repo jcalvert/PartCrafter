@@ -92,7 +92,8 @@ class BenchmarkValidityTests(unittest.TestCase):
                     "--output_dir", directory, "--tag", "check", "--device", "cpu",
                     "--dense_octree_depth", "2", "--hierarchical_octree_depth", "3",
                     "--decode_chunk_size", "7", "--num_inference_steps", "1",
-                    "--band_mode", "logit", "--band_threshold", "0.25"]
+                    "--band_mode", "logit", "--band_threshold", "0.25",
+                    "--dtype", "float32", "--dit_dtype", "float16"]
             with patch("sys.argv", argv), patch("huggingface_hub.snapshot_download") as download, \
                     patch.object(PartCrafterPipeline, "from_pretrained", return_value=pipe), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -110,6 +111,10 @@ class BenchmarkValidityTests(unittest.TestCase):
             self.assertEqual(pipe.call_args.kwargs["band_mode"], "logit")
             self.assertEqual(pipe.call_args.kwargs["band_threshold"], 0.25)
             self.assertEqual(manifest["band_mode"], "logit")
+            self.assertEqual(manifest["dtype"], "torch.float32")
+            self.assertEqual(manifest["dit_dtype"], "torch.float16")
+            pipe.to.assert_called_once_with("cpu", torch.float32)
+            pipe.transformer.to.assert_called_once_with(dtype=torch.float16)
             self.assertIsNone(outputs[0])
 
 
@@ -162,6 +167,110 @@ class SelectiveRefinementTests(unittest.TestCase):
         self.assertGreater(march.call_args.args[0].max(), 1)
         self.assertGreater(len(faces), 3)
         self.assertGreater(len(vertices), 3)
+
+
+class TransformerPrecisionTests(unittest.TestCase):
+    def test_cli_dit_dtype_defaults_to_pipeline_dtype(self):
+        pipe = Mock(device="cpu")
+        pipe.return_value = SimpleNamespace(meshes=[trimesh.creation.box()])
+        pipe.to.return_value = pipe
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            image_path = Path(directory) / "input.png"
+            Image.new("RGB", (2, 2)).save(image_path)
+            argv = ["inference_partcrafter", "--image_path", str(image_path), "--num_parts", "1",
+                    "--output_dir", directory, "--tag", "check", "--device", "cpu",
+                    "--dtype", "bfloat16"]
+            with patch("sys.argv", argv), patch("huggingface_hub.snapshot_download"), \
+                    patch.object(PartCrafterPipeline, "from_pretrained", return_value=pipe), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                runpy.run_path(str(ROOT / "scripts/inference_partcrafter.py"), run_name="__main__")
+            pipe.to.assert_called_once_with("cpu", torch.bfloat16)
+            pipe.transformer.to.assert_called_once_with(dtype=torch.bfloat16)
+            manifest = json.loads((Path(directory) / "check/manifest.json").read_text())
+            self.assertEqual(manifest["dit_dtype"], manifest["dtype"])
+            self.assertNotIn("failed_parts", manifest)
+
+    def test_pipeline_precision_boundaries_with_mocked_components(self):
+        # Exercise pipeline orchestration only; all neural components are mocks.
+        for pipeline_dtype in (torch.float32, torch.float16):
+            for dit_dtype in (torch.float32, torch.float16, torch.bfloat16):
+                with self.subTest(pipeline_dtype=pipeline_dtype, dit_dtype=dit_dtype):
+                    self.check_precision_boundaries(pipeline_dtype, dit_dtype)
+
+    def check_precision_boundaries(self, pipeline_dtype, dit_dtype):
+        latent_history, query_history = [], []
+
+        def transformer_call(latents, timestep, encoder_hidden_states, **kwargs):
+            self.assertEqual(latents.dtype, dit_dtype)
+            self.assertEqual(encoder_hidden_states.dtype, dit_dtype)
+            # Distinct branches prove guidance is performed after promoting to fp32.
+            noise = torch.empty_like(latents)
+            noise[:2] = 0.1
+            noise[2:] = 0.3
+            return (noise,)
+
+        transformer = Mock(dtype=dit_dtype, config=SimpleNamespace(in_channels=2),
+                           side_effect=transformer_call)
+
+        def scheduler_step(noise, timestep, latents, **kwargs):
+            self.assertEqual(noise.dtype, torch.float32)
+            self.assertEqual(latents.dtype, pipeline_dtype)
+            expected = torch.tensor(0.1, dtype=dit_dtype).float() + 7 * (
+                torch.tensor(0.3, dtype=dit_dtype).float() - torch.tensor(0.1, dtype=dit_dtype).float()
+            )
+            torch.testing.assert_close(noise, torch.full_like(noise, expected))
+            latent_history.append(latents.clone())
+            # Deliberately promote output to check that the pipeline restores latent dtype.
+            return ((latents.float() - 0.01 * noise).double(),)
+
+        scheduler = SimpleNamespace(order=1, timesteps=torch.tensor([1.0, 0.5]),
+                                    set_timesteps=Mock(), step=Mock(side_effect=scheduler_step))
+
+        def decode(latents, sampled_points, num_chunks):
+            self.assertEqual(latents.dtype, pipeline_dtype)
+            self.assertEqual(sampled_points.dtype, pipeline_dtype)
+            self.assertEqual(num_chunks, 7)
+            query_history.append(sampled_points.clone())
+            return SimpleNamespace(sample=torch.zeros(1, len(sampled_points[0]), 1, dtype=pipeline_dtype))
+
+        vae = Mock(decode=Mock(side_effect=decode))
+        embeds = torch.ones(2, 3, 4, dtype=pipeline_dtype)
+        supplied = torch.arange(12).reshape(2, 3, 2).to(pipeline_dtype)
+        pipe = SimpleNamespace(
+            image_encoder_dinov2=SimpleNamespace(dtype=pipeline_dtype),
+            transformer=transformer, vae=vae, scheduler=scheduler,
+            _execution_device=torch.device("cpu"), dtype=pipeline_dtype,
+            encode_image=Mock(return_value=(embeds, torch.zeros_like(embeds))),
+            prepare_latents=lambda *args: PartCrafterPipeline.prepare_latents(None, *args),
+            do_classifier_free_guidance=True, guidance_scale=7, interrupt=False,
+            set_progress_bar_config=Mock(),
+            progress_bar=lambda **kwargs: contextlib.nullcontext(Mock()),
+            maybe_free_model_hooks=Mock(),
+        )
+        self.assertEqual(PartCrafterPipeline.dtype.fget(pipe), pipeline_dtype)
+
+        def extract(geometric_func, device, dtype, **kwargs):
+            self.assertEqual(dtype, pipeline_dtype)
+            self.assertEqual(kwargs["band_mode"], "logit")
+            self.assertEqual(kwargs["band_threshold"], 0.25)
+            # Multiple chunks per part, all through the exact decoder path.
+            for _ in range(2):
+                geometric_func(torch.zeros(1, 2, 3, dtype=dtype))
+            box = trimesh.creation.box()
+            return box.vertices, box.faces
+
+        with patch("src.pipelines.pipeline_partcrafter.hierarchical_extract_geometry", side_effect=extract), \
+                contextlib.redirect_stdout(io.StringIO()):
+            result = PartCrafterPipeline.__call__(
+                pipe, torch.zeros(2, 3, 2, 2), num_inference_steps=2, num_tokens=3,
+                latents=supplied, decode_chunk_size=7, band_mode="logit", band_threshold=0.25,
+            )
+        torch.testing.assert_close(latent_history[0], supplied)
+        self.assertEqual(transformer.call_count, 2)
+        self.assertEqual(len(query_history), 4)
+        self.assertEqual(len(result.meshes), 2)
+        vae.set_exact_decoder.assert_called_once()
+        vae.set_flash_decoder.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -83,6 +83,11 @@ plus six-neighbour sign changes before dilation. Marching cubes uses raw logits
 at level zero. The default `--band_mode legacy` preserves the original sigmoid
 band at width 1.0 in the grid's dtype and ignores `--band_threshold`.
 
+To reduce only transformer precision, add `--dtype float32 --dit_dtype float16`
+(or `--dit_dtype bfloat16`). The VAE, DINO encoder, latents and extraction keep
+`--dtype`; guidance and scheduler predictions use fp32. Without `--dit_dtype`,
+the transformer uses the same precision as `--dtype`.
+
 ### VLM-Based Part Suggestion
 Instead of manually specifying `--num_parts`, you can use a VLM to automatically suggest the number of parts:
 ```
