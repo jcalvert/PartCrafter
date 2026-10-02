@@ -338,7 +338,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         # verbose=True
                     )
                     mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
-                except:
+                except Exception as e:
+                    # upstream swallowed this silently; report it so a failed part is visible
+                    import traceback
+                    print(f"[partcrafter] part {i} mesh extraction failed: {type(e).__name__}: {e}")
+                    traceback.print_exc()
                     mesh_v_f = None
                     mesh = None
                 output.append(mesh_v_f)

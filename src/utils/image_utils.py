@@ -17,7 +17,10 @@ def find_bounding_box(gray_image):
     x, y, w, h = cv2.boundingRect(max_contour)
     return x, y, w, h
 
-def load_image(img_path, bg_color=None, rmbg_net=None, padding_ratio=0.1, device='cuda'):
+def load_image(img_path, bg_color=None, rmbg_net=None, padding_ratio=0.1, device=None):
+    if device is None:
+        from src.utils.device_utils import get_device
+        device = get_device()
     img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if img is None:
         return f"invalid image path {img_path}"
@@ -140,7 +143,7 @@ def load_image(img_path, bg_color=None, rmbg_net=None, padding_ratio=0.1, device
 
     return padded_tensor
 
-def prepare_image(image_path, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=None, padding_ratio=0.1, device='cuda'):
+def prepare_image(image_path, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=None, padding_ratio=0.1, device=None):
     if os.path.isfile(image_path):
         img_tensor = load_image(image_path, bg_color=bg_color, rmbg_net=rmbg_net, padding_ratio=padding_ratio, device=device)
         img_np = img_tensor.permute(1,2,0).cpu().numpy()

@@ -12,7 +12,7 @@ from diffusers.models.normalization import FP32LayerNorm, LayerNorm
 from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from einops import repeat
-from torch_cluster import fps
+import contextlib
 from tqdm import tqdm
 
 from ..attention_processor import FusedTripoSGAttnProcessor2_0, TripoSGAttnProcessor2_0, FlashTripo2AttnProcessor2_0
@@ -158,7 +158,7 @@ class TripoSGDecoder(nn.Module):
     ):
         logits = model_fn(queries, sample)
         if grad:
-            with torch.autocast(device_type="cuda", dtype=torch.float32):
+            with (torch.autocast(device_type="cuda", dtype=torch.float32) if queries.device.type == "cuda" else contextlib.nullcontext()):
                 if self.grad_type == "numerical":
                     interval = self.grad_interval
                     grad_value = []
@@ -422,7 +422,8 @@ class TripoSGVAEModel(ModelMixin, ConfigMixin):
             torch.arange(batch_size).to(x.device).repeat_interleave(num_points)
         )
 
-        # fps sampling
+        # fps sampling (torch_cluster is CUDA-only and only needed when encoding meshes, i.e. training)
+        from torch_cluster import fps
         sampling_ratio = 1.0 / 4
         sampled_indices = fps(
             flattened_points[:, :3],

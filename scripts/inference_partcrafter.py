@@ -14,10 +14,44 @@ from PIL import Image
 from accelerate.utils import set_seed
 
 from src.utils.data_utils import get_colored_mesh_composition
-from src.utils.render_utils import render_views_around_mesh, render_normal_views_around_mesh, make_grid_for_images_or_videos, export_renderings
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline
 from src.utils.image_utils import prepare_image
 from src.models.briarmbg import BriaRMBG
+from src.utils.device_utils import get_device
+import threading
+import resource
+
+
+class PeakMemory:
+    """Samples accelerator memory in a thread; MPS has no peak counter of its own."""
+    def __init__(self, device, interval=0.25):
+        self.device, self.interval, self.peak, self._stop = device, interval, 0, False
+    def _read(self):
+        if self.device == "mps":
+            return torch.mps.driver_allocated_memory()
+        if self.device == "cuda":
+            return torch.cuda.memory_allocated()
+        return 0
+    def _loop(self):
+        while not self._stop:
+            self.peak = max(self.peak, self._read())
+            time.sleep(self.interval)
+    def __enter__(self):
+        self._t = threading.Thread(target=self._loop, daemon=True); self._t.start(); return self
+    def __exit__(self, *a):
+        self._stop = True; self._t.join(); self.peak = max(self.peak, self._read())
+
+
+def masked_input(image_path, mask_path, export_dir):
+    """Combine an RGB image with a supplied mask (or keep its own alpha) and write RGBA,
+    so prepare_image takes its alpha path and never needs a background-removal net."""
+    img = Image.open(image_path)
+    if mask_path is not None:
+        mask = Image.open(mask_path).convert("L").resize(img.size)
+        img = img.convert("RGB"); img.putalpha(mask)
+    out = os.path.join(export_dir, "input_rgba.png")
+    img.convert("RGBA").save(out)
+    return out
 
 @torch.no_grad()
 def run_triposg(
@@ -33,11 +67,12 @@ def run_triposg(
     use_flash_decoder: bool = False,
     rmbg: bool = False,
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
+    device: str = None,
+    use_alpha: bool = False,
 ) -> trimesh.Scene:
 
-    if rmbg:
-        img_pil = prepare_image(image_input, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=rmbg_net)
+    if rmbg or use_alpha:
+        img_pil = prepare_image(image_input, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=rmbg_net, device=device)
     else:
         img_pil = Image.open(image_input)
     start_time = time.time()
@@ -62,8 +97,6 @@ def run_triposg(
 MAX_NUM_PARTS = 16
 
 if __name__ == "__main__":
-    device = "cuda"
-    dtype = torch.float16
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_path", type=str, required=True)
@@ -76,7 +109,11 @@ if __name__ == "__main__":
     parser.add_argument("--guidance_scale", type=float, default=7.0)
     parser.add_argument("--max_num_expanded_coords", type=int, default=1e9)
     parser.add_argument("--use_flash_decoder", action="store_true")
-    parser.add_argument("--rmbg", action="store_true")
+    parser.add_argument("--rmbg", action="store_true", help="run RMBG-1.4 (non-commercial licence); prefer --mask or an RGBA input")
+    parser.add_argument("--mask", type=str, default=None, help="foreground mask to use instead of background removal")
+    parser.add_argument("--use_alpha", action="store_true", help="input is RGBA (or --mask given): crop/pad by its alpha, no RMBG")
+    parser.add_argument("--device", type=str, default=None, help="cuda, mps or cpu (default: auto)")
+    parser.add_argument("--dtype", type=str, default=None, choices=["float16", "float32", "bfloat16"], help="default: float16 on cuda, float32 elsewhere")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--part_suggest", action="store_true", help="use VLM to suggest num_parts automatically")
     parser.add_argument("--style_transfer", action="store_true", help="apply Objaverse-style transfer to input image")
@@ -85,6 +122,9 @@ if __name__ == "__main__":
     parser.add_argument("--style_provider", type=str, default="gemini", help="provider for style transfer (default: gemini)")
     parser.add_argument("--style_model", type=str, default=None, help="model name for style transfer (default: gemini-3.1-flash-image-preview)")
     args = parser.parse_args()
+    device = get_device(args.device)
+    dtype = getattr(torch, args.dtype) if args.dtype else (torch.float16 if device == "cuda" else torch.float32)
+    print(f"device={device} dtype={dtype}")
 
     if args.num_parts is not None:
         assert 1 <= args.num_parts <= MAX_NUM_PARTS, f"num_parts must be in [1, {MAX_NUM_PARTS}]"
@@ -95,11 +135,13 @@ if __name__ == "__main__":
     partcrafter_weights_dir = "pretrained_weights/PartCrafter"
     rmbg_weights_dir = "pretrained_weights/RMBG-1.4"
     snapshot_download(repo_id="wgsxm/PartCrafter", local_dir=partcrafter_weights_dir)
-    snapshot_download(repo_id="briaai/RMBG-1.4", local_dir=rmbg_weights_dir)
-
-    # init rmbg model for background removal
-    rmbg_net = BriaRMBG.from_pretrained(rmbg_weights_dir).to(device)
-    rmbg_net.eval() 
+    rmbg_net = None
+    if args.rmbg:
+        snapshot_download(repo_id="briaai/RMBG-1.4", local_dir=rmbg_weights_dir)
+        # init rmbg model for background removal
+        rmbg_net = BriaRMBG.from_pretrained(rmbg_weights_dir).to(device)
+        rmbg_net.eval()
+    t_load = time.time()
 
     # init tripoSG pipeline
     pipe: PartCrafterPipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir).to(device, dtype)
@@ -115,6 +157,9 @@ if __name__ == "__main__":
     os.makedirs(export_dir, exist_ok=True)
 
     image_path = args.image_path
+    use_alpha = args.use_alpha or args.mask is not None
+    if use_alpha:
+        image_path = masked_input(image_path, args.mask, export_dir)
 
     # style transfer: convert real-world photo to Objaverse-style rendering
     if args.style_transfer:
@@ -141,6 +186,11 @@ if __name__ == "__main__":
         num_parts = args.num_parts
 
     # run inference
+    if device == "mps":
+        torch.mps.empty_cache()
+    t0 = time.time()
+    peak = PeakMemory(device)
+    peak.__enter__()
     outputs, processed_image = run_triposg(
         pipe,
         image_input=image_path,
@@ -155,7 +205,11 @@ if __name__ == "__main__":
         rmbg=args.rmbg,
         dtype=dtype,
         device=device,
+        use_alpha=use_alpha,
     )
+    peak.__exit__()
+    run_seconds = time.time() - t0
+    processed_image.save(os.path.join(export_dir, "processed_input.png"))
 
     for i, mesh in enumerate(outputs):
         mesh.export(os.path.join(export_dir, f"part_{i:02}.glb"))
@@ -174,6 +228,18 @@ if __name__ == "__main__":
             for i in range(num_parts)
         ],
         "composite_file": "object.glb",
+        "device": device,
+        "dtype": str(dtype),
+        "num_inference_steps": args.num_inference_steps,
+        "seed": args.seed,
+        "run_seconds": round(run_seconds, 1),
+        "peak_accelerator_gb": round(peak.peak / 2**30, 2),
+        "max_rss_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30, 2),
+        "part_stats": [
+            {"vertices": len(m.vertices), "faces": len(m.faces), "watertight": bool(m.is_watertight),
+             "bounds": np.asarray(m.bounds).round(3).tolist() if len(m.vertices) > 1 else None}
+            for m in outputs
+        ],
     }
     with open(os.path.join(export_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
@@ -182,6 +248,7 @@ if __name__ == "__main__":
 
     if args.render:
         print("Start rendering...")
+        from src.utils.render_utils import render_views_around_mesh, render_normal_views_around_mesh, make_grid_for_images_or_videos, export_renderings
         num_views = 36
         radius = 4
         fps = 18
