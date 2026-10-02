@@ -170,8 +170,14 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return noise
+        if latents is not None:
+            if not isinstance(latents, torch.Tensor):
+                raise TypeError("latents must be a torch.Tensor")
+            if tuple(latents.shape) != shape:
+                raise ValueError(f"Expected latents shape {shape}, got {tuple(latents.shape)}")
+            return latents.to(device=device, dtype=dtype)
+
+        return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
     @torch.no_grad()
     def __call__(
@@ -192,9 +198,16 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         hierarchical_octree_depth: int = 9,
         max_num_expanded_coords: int = 1e8,
         flash_octree_depth: int = 9,
-        use_flash_decoder: bool = True,
+        use_flash_decoder: bool = False,
         return_dict: bool = True,
+        decode_chunk_size: int = 50000,
+        band_mode: str = "legacy",
     ):
+        if decode_chunk_size <= 0:
+            raise ValueError("decode_chunk_size must be positive")
+        if band_mode != "legacy":
+            raise ValueError("band_mode must be 'legacy'")
+
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
@@ -321,7 +334,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             torch.mps.synchronize()  # MPS is asynchronous: the denoising bar above only measures queueing
         _t = _time.time()
         print(f"[partcrafter] denoising done (synchronised) at {_t:.1f}", flush=True)
-        self.vae.set_flash_decoder()
+        if use_flash_decoder:
+            self.vae.set_flash_decoder()
+        else:
+            self.vae.set_exact_decoder()
         output, meshes = [], []
         self.set_progress_bar_config(
             desc="Decoding", 
@@ -330,7 +346,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         )
         with self.progress_bar(total=batch_size) as progress_bar:
             for i in range(batch_size):
-                geometric_func = lambda x: self.vae.decode(latents[i].unsqueeze(0), sampled_points=x).sample
+                geometric_func = lambda x: self.vae.decode(
+                    latents[i].unsqueeze(0), sampled_points=x, num_chunks=decode_chunk_size
+                ).sample
                 try:
                     mesh_v_f = hierarchical_extract_geometry(
                         geometric_func,
@@ -340,6 +358,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         dense_octree_depth=dense_octree_depth,
                         hierarchical_octree_depth=hierarchical_octree_depth,
                         max_num_expanded_coords=max_num_expanded_coords,
+                        band_mode=band_mode,
                         # verbose=True
                     )
                     mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
@@ -363,4 +382,3 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             return (output, meshes)
 
         return PartCrafterPipelineOutput(samples=output, meshes=meshes)
-

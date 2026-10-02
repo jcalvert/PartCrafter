@@ -69,6 +69,10 @@ def run_triposg(
     dtype: torch.dtype = torch.float16,
     device: str = None,
     use_alpha: bool = False,
+    dense_octree_depth: int = 8,
+    hierarchical_octree_depth: int = 9,
+    decode_chunk_size: int = 50000,
+    band_mode: str = "legacy",
 ) -> trimesh.Scene:
 
     if rmbg or use_alpha:
@@ -86,14 +90,24 @@ def run_triposg(
         guidance_scale=guidance_scale,
         max_num_expanded_coords=max_num_expanded_coords,
         use_flash_decoder=use_flash_decoder,
+        dense_octree_depth=dense_octree_depth,
+        hierarchical_octree_depth=hierarchical_octree_depth,
+        decode_chunk_size=decode_chunk_size,
+        band_mode=band_mode,
     ).meshes
     end_time = time.time()
     print(f"Time elapsed: {end_time - start_time:.2f} seconds")
-    for i in range(len(outputs)):
-        if outputs[i] is None:
-            # If the generated mesh is None (decoding error), use a dummy mesh
-            outputs[i] = trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
     return outputs, img_pil
+
+def failed_part_indices(meshes):
+    return [i for i, mesh in enumerate(meshes) if mesh is None or len(mesh.faces) < 4]
+
+
+def meshes_for_export(meshes):
+    """Substitute missing parts only in the export copy, retaining failure evidence."""
+    return [mesh if mesh is not None else trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
+            for mesh in meshes]
+
 
 MAX_NUM_PARTS = 16
 
@@ -110,6 +124,10 @@ if __name__ == "__main__":
     parser.add_argument("--guidance_scale", type=float, default=7.0)
     parser.add_argument("--max_num_expanded_coords", type=int, default=1e9)
     parser.add_argument("--use_flash_decoder", action="store_true")
+    parser.add_argument("--dense_octree_depth", type=int, default=8)
+    parser.add_argument("--hierarchical_octree_depth", type=int, default=9)
+    parser.add_argument("--decode_chunk_size", type=int, default=50000)
+    parser.add_argument("--band_mode", choices=["legacy"], default="legacy")
     parser.add_argument("--rmbg", action="store_true", help="run RMBG-1.4 (non-commercial licence); prefer --mask or an RGBA input")
     parser.add_argument("--mask", type=str, default=None, help="foreground mask to use instead of background removal")
     parser.add_argument("--use_alpha", action="store_true", help="input is RGBA (or --mask given): crop/pad by its alpha, no RMBG")
@@ -207,15 +225,21 @@ if __name__ == "__main__":
         dtype=dtype,
         device=device,
         use_alpha=use_alpha,
+        dense_octree_depth=args.dense_octree_depth,
+        hierarchical_octree_depth=args.hierarchical_octree_depth,
+        decode_chunk_size=args.decode_chunk_size,
+        band_mode=args.band_mode,
     )
     peak.__exit__()
     run_seconds = time.time() - t0
     processed_image.save(os.path.join(export_dir, "processed_input.png"))
 
-    for i, mesh in enumerate(outputs):
+    failed_parts = failed_part_indices(outputs)
+    export_meshes = meshes_for_export(outputs)
+    for i, mesh in enumerate(export_meshes):
         mesh.export(os.path.join(export_dir, f"part_{i:02}.glb"))
 
-    merged_mesh = get_colored_mesh_composition(outputs)
+    merged_mesh = get_colored_mesh_composition(export_meshes)
     merged_mesh.export(os.path.join(export_dir, "object.glb"))
 
     # write manifest
@@ -232,6 +256,11 @@ if __name__ == "__main__":
         "device": device,
         "dtype": str(dtype),
         "num_inference_steps": args.num_inference_steps,
+        "dense_octree_depth": args.dense_octree_depth,
+        "hierarchical_octree_depth": args.hierarchical_octree_depth,
+        "decode_chunk_size": args.decode_chunk_size,
+        "band_mode": args.band_mode,
+        "use_flash_decoder": args.use_flash_decoder,
         "seed": args.seed,
         "run_seconds": round(run_seconds, 1),
         "peak_accelerator_gb": round(peak.peak / 2**30, 2),
@@ -239,11 +268,18 @@ if __name__ == "__main__":
         "part_stats": [
             {"vertices": len(m.vertices), "faces": len(m.faces), "watertight": bool(m.is_watertight),
              "bounds": np.asarray(m.bounds).round(3).tolist() if len(m.vertices) > 1 else None}
+            if m is not None else None
             for m in outputs
         ],
     }
+    if failed_parts:
+        manifest["failed_parts"] = failed_parts
     with open(os.path.join(export_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+
+    if failed_parts:
+        print(f"Failed parts: {failed_parts}; exported available meshes to {export_dir}", file=sys.stderr)
+        sys.exit(2)
 
     print(f"Generated {len(outputs)} parts and saved to {export_dir}")
 
@@ -292,4 +328,3 @@ if __name__ == "__main__":
         rendered_normal.save(os.path.join(export_dir, "rendering_normal.png"))
         rendered_grid.save(os.path.join(export_dir, "rendering_grid.png"))
         print("Rendering done.")
-

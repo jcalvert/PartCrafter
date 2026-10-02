@@ -270,6 +270,10 @@ class TripoSGVAEModel(ModelMixin, ConfigMixin):
     def set_flash_decoder(self):
         self.decoder.set_flash_processor(FlashTripo2AttnProcessor2_0())
 
+    def set_exact_decoder(self):
+        """Restore exact cross attention, including after a flash decode."""
+        self.decoder.set_flash_processor(TripoSGAttnProcessor2_0())
+
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.fuse_qkv_projections with FusedAttnProcessor2_0->FusedTripoSGAttnProcessor2_0
     def fuse_qkv_projections(self):
         """

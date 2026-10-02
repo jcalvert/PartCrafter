@@ -8,6 +8,9 @@ from skimage import measure
 from einops import repeat
 import torch.nn.functional as F
 
+# Updated in place for each extraction, so imported references remain usable.
+LAST_EXTRACTION_STATS: List[dict] = []
+
 def generate_dense_grid_points(
     bbox_min: np.ndarray, bbox_max: np.ndarray, octree_depth: int, indexing: str = "ij"
 ):
@@ -121,7 +124,7 @@ def find_candidates_band(
 
     return core_mesh_coords 
 
-def expand_edge_region_fast(edge_coords, grid_size, dtype):
+def expand_edge_region_fast(edge_coords, grid_size, dtype, max_num_expanded_coords=-1, stats=None):
     expanded_tensor = torch.zeros(grid_size, grid_size, grid_size, device=edge_coords.device, dtype=dtype, requires_grad=False)
     expanded_tensor[edge_coords[:, 0], edge_coords[:, 1], edge_coords[:, 2]] = 1
     if grid_size < 512:
@@ -131,6 +134,12 @@ def expand_edge_region_fast(edge_coords, grid_size, dtype):
         kernel_size = 3
         pooled_tensor = torch.nn.functional.max_pool3d(expanded_tensor.unsqueeze(0).unsqueeze(0), kernel_size=kernel_size, stride=1, padding=1).squeeze()
     expanded_coords_low_res = torch.nonzero(pooled_tensor, as_tuple=False).to(torch.int16)
+
+    estimated_count = 8 * len(expanded_coords_low_res)
+    if stats is not None:
+        stats["expanded_coords"] = estimated_count
+    if max_num_expanded_coords > 0 and estimated_count > max_num_expanded_coords:
+        raise ValueError(f"expanded_coords is too large, {estimated_count} > {max_num_expanded_coords}")
 
     expanded_coords_high_res = torch.stack([
         torch.cat((expanded_coords_low_res[:, 0] * 2, expanded_coords_low_res[:, 0] * 2, expanded_coords_low_res[:, 0] * 2, expanded_coords_low_res[:, 0] * 2, expanded_coords_low_res[:, 0] * 2 + 1, expanded_coords_low_res[:, 0] * 2 + 1, expanded_coords_low_res[:, 0] * 2 + 1, expanded_coords_low_res[:, 0] * 2 + 1)),
@@ -159,6 +168,7 @@ def hierarchical_extract_geometry(
     hierarchical_octree_depth: int = 9, 
     max_num_expanded_coords: int = 1e8, 
     verbose: bool = False,
+    band_mode: str = "legacy",
 ):
     """
     Args:
@@ -168,7 +178,13 @@ def hierarchical_extract_geometry(
         dense_octree_depth:
         hierarchical_octree_depth:
     Returns:
+        (vertices, faces), or (vertices, faces, stats) when verbose=True.
+        Each stats entry records the depth, raw candidates, expanded coordinates,
+        and coordinates queried. The dense level queries all grid coordinates.
     """
+    LAST_EXTRACTION_STATS.clear()
+    if band_mode != "legacy":
+        raise ValueError("band_mode must be 'legacy'")
     if isinstance(bounds, float):
         bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
@@ -184,29 +200,38 @@ def hierarchical_extract_geometry(
         dtype=dtype
     )
     
-    if verbose:
-        print(f'step 1 query num: {xyz_samples.shape[0]}')
+    dense_count = len(xyz_samples)
+    level_stats = {"octree_depth": dense_octree_depth, "raw_candidates": dense_count,
+                   "expanded_coords": dense_count, "queried_coords": 0}
+    LAST_EXTRACTION_STATS.append(level_stats)
     grid_logits = geometric_func(xyz_samples.unsqueeze(0)).to(dtype).view(grid_size[0], grid_size[1], grid_size[2])
+    level_stats["queried_coords"] = dense_count
+    if verbose:
+        print(f"extraction level: {level_stats}")
     # print(f'step 1 grid_logits shape: {grid_logits.shape}')
     for i in range(hierarchical_octree_depth - dense_octree_depth):
         curr_octree_depth = dense_octree_depth + i + 1
         # upsample
         grid_size = 2**curr_octree_depth
         normalize_offset = grid_size / 2
-        high_res_occupancy = parallel_zoom(grid_logits, 2).to(dtype)
-
         band_threshold = 1.0
         edge_coords = find_candidates_band(grid_logits, band_threshold)
-        expanded_coords = expand_edge_region_fast(edge_coords, grid_size=int(grid_size/2), dtype=dtype).to(dtype)
-        if verbose:
-            print(f'step {i+2} query num: {len(expanded_coords)}')
-        if max_num_expanded_coords > 0 and len(expanded_coords) > max_num_expanded_coords:
-            raise ValueError(f"expanded_coords is too large, {len(expanded_coords)} > {max_num_expanded_coords}")
+        level_stats = {"octree_depth": curr_octree_depth, "raw_candidates": len(edge_coords),
+                       "expanded_coords": 0, "queried_coords": 0}
+        LAST_EXTRACTION_STATS.append(level_stats)
+        expanded_coords = expand_edge_region_fast(
+            edge_coords, grid_size=int(grid_size/2), dtype=dtype,
+            max_num_expanded_coords=max_num_expanded_coords, stats=level_stats,
+        ).to(dtype)
+        high_res_occupancy = parallel_zoom(grid_logits, 2).to(dtype)
         expanded_coords_norm = (expanded_coords - normalize_offset) * (abs(bounds[0]) / normalize_offset)
 
         all_logits = None
 
         all_logits = geometric_func(expanded_coords_norm.unsqueeze(0)).to(dtype)
+        level_stats["queried_coords"] = len(expanded_coords)
+        if verbose:
+            print(f"extraction level: {level_stats}")
         all_logits = torch.cat([expanded_coords_norm, all_logits[0]], dim=1)
         # print("all logits shape = ", all_logits.shape)
 
@@ -225,4 +250,6 @@ def hierarchical_extract_geometry(
     vertices = vertices / (2**hierarchical_octree_depth) * bbox_size.cpu().numpy() + bbox_min.cpu().numpy()
     mesh_v_f = (vertices.astype(np.float32), np.ascontiguousarray(faces))
 
+    if verbose:
+        return (*mesh_v_f, [dict(stats) for stats in LAST_EXTRACTION_STATS])
     return mesh_v_f
