@@ -91,7 +91,8 @@ class BenchmarkValidityTests(unittest.TestCase):
             argv = ["inference_partcrafter", "--image_path", str(image_path), "--num_parts", "3",
                     "--output_dir", directory, "--tag", "check", "--device", "cpu",
                     "--dense_octree_depth", "2", "--hierarchical_octree_depth", "3",
-                    "--decode_chunk_size", "7", "--num_inference_steps", "1"]
+                    "--decode_chunk_size", "7", "--num_inference_steps", "1",
+                    "--band_mode", "logit", "--band_threshold", "0.25"]
             with patch("sys.argv", argv), patch("huggingface_hub.snapshot_download") as download, \
                     patch.object(PartCrafterPipeline, "from_pretrained", return_value=pipe), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -106,7 +107,61 @@ class BenchmarkValidityTests(unittest.TestCase):
             self.assertTrue((export_dir / "part_02.glb").exists())
             self.assertTrue((export_dir / "object.glb").exists())
             self.assertEqual(pipe.call_args.kwargs["decode_chunk_size"], 7)
+            self.assertEqual(pipe.call_args.kwargs["band_mode"], "logit")
+            self.assertEqual(pipe.call_args.kwargs["band_threshold"], 0.25)
+            self.assertEqual(manifest["band_mode"], "logit")
             self.assertIsNone(outputs[0])
+
+
+class SelectiveRefinementTests(unittest.TestCase):
+    def test_legacy_keeps_dtype_dependent_saturation(self):
+        logits = torch.full((5, 5, 5), 9.0)
+        self.assertEqual(len(geometry.find_candidates_band(logits, 1.0)), 27)
+        self.assertEqual(len(geometry.find_candidates_band(logits.half(), 1.0)), 0)
+
+    def test_logit_band_is_compared_in_float32(self):
+        logits = torch.full((5, 5, 5), 3.0, dtype=torch.float16)
+        logits[2, 2, 2] = 1.0
+        candidates = geometry.find_candidates_band(logits, 1.0001, band_mode="logit")
+        self.assertEqual(candidates.tolist(), [[2, 2, 2]])
+        self.assertEqual(len(geometry.find_candidates_band(logits, 1.0, band_mode="logit")), 0)
+
+    def test_sign_changes_cover_both_endpoints_on_all_axes_and_boundaries(self):
+        for axis in range(3):
+            logits = torch.full((5, 5, 5), 10.0)
+            lower_half = [slice(None)] * 3
+            lower_half[axis] = slice(None, 2)
+            logits[tuple(lower_half)] = -10.0
+            candidates = geometry.find_candidates_band(logits, 0.95, band_mode="logit")
+            self.assertEqual(len(candidates), 50)
+            self.assertEqual(set(candidates[:, axis].tolist()), {1, 2})
+
+    def test_six_neighbours_exclude_diagonals(self):
+        logits = torch.full((5, 5, 5), 10.0)
+        logits[2, 2, 2] = -10.0
+        candidates = geometry.find_candidates_band(logits, 0.95, band_mode="logit")
+        self.assertEqual(len(candidates), 7)
+        self.assertNotIn([1, 1, 1], candidates.tolist())
+
+    def test_logit_refinement_reduces_queries_and_marches_raw_logits(self):
+        def sphere(points):
+            return points.square().sum(dim=-1, keepdim=True) - 0.1
+
+        kwargs = dict(device="cpu", dtype=torch.float32, bounds=1.0,
+                      dense_octree_depth=4, hierarchical_octree_depth=5)
+        geometry.hierarchical_extract_geometry(sphere, **kwargs)
+        legacy = [dict(s) for s in geometry.LAST_EXTRACTION_STATS]
+        with patch.object(geometry.measure, "marching_cubes", wraps=geometry.measure.marching_cubes) as march:
+            vertices, faces = geometry.hierarchical_extract_geometry(
+                sphere, band_mode="logit", band_threshold=0.01, **kwargs
+            )
+        selective = geometry.LAST_EXTRACTION_STATS
+        self.assertLess(selective[1]["raw_candidates"], legacy[1]["raw_candidates"])
+        self.assertLess(selective[1]["queried_coords"], legacy[1]["queried_coords"])
+        self.assertEqual(march.call_args.args[1], 0)
+        self.assertGreater(march.call_args.args[0].max(), 1)
+        self.assertGreater(len(faces), 3)
+        self.assertGreater(len(vertices), 3)
 
 
 if __name__ == "__main__":

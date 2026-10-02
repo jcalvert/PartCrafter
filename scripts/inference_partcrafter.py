@@ -73,6 +73,7 @@ def run_triposg(
     hierarchical_octree_depth: int = 9,
     decode_chunk_size: int = 50000,
     band_mode: str = "legacy",
+    band_threshold: float = 0.95,
 ) -> trimesh.Scene:
 
     if rmbg or use_alpha:
@@ -94,6 +95,7 @@ def run_triposg(
         hierarchical_octree_depth=hierarchical_octree_depth,
         decode_chunk_size=decode_chunk_size,
         band_mode=band_mode,
+        band_threshold=band_threshold,
     ).meshes
     end_time = time.time()
     print(f"Time elapsed: {end_time - start_time:.2f} seconds")
@@ -127,7 +129,10 @@ if __name__ == "__main__":
     parser.add_argument("--dense_octree_depth", type=int, default=8)
     parser.add_argument("--hierarchical_octree_depth", type=int, default=9)
     parser.add_argument("--decode_chunk_size", type=int, default=50000)
-    parser.add_argument("--band_mode", choices=["legacy"], default="legacy")
+    parser.add_argument("--band_mode", choices=["legacy", "logit"], default="legacy",
+                        help="logit opts into selective refinement and changes mesh quality")
+    parser.add_argument("--band_threshold", type=float, default=0.95,
+                        help="raw-logit band width in logit mode; ignored in legacy mode")
     parser.add_argument("--rmbg", action="store_true", help="run RMBG-1.4 (non-commercial licence); prefer --mask or an RGBA input")
     parser.add_argument("--mask", type=str, default=None, help="foreground mask to use instead of background removal")
     parser.add_argument("--use_alpha", action="store_true", help="input is RGBA (or --mask given): crop/pad by its alpha, no RMBG")
@@ -229,6 +234,7 @@ if __name__ == "__main__":
         hierarchical_octree_depth=args.hierarchical_octree_depth,
         decode_chunk_size=args.decode_chunk_size,
         band_mode=args.band_mode,
+        band_threshold=args.band_threshold,
     )
     peak.__exit__()
     run_seconds = time.time() - t0
@@ -260,6 +266,7 @@ if __name__ == "__main__":
         "hierarchical_octree_depth": args.hierarchical_octree_depth,
         "decode_chunk_size": args.decode_chunk_size,
         "band_mode": args.band_mode,
+        "band_threshold": args.band_threshold,
         "use_flash_decoder": args.use_flash_decoder,
         "seed": args.seed,
         "run_seconds": round(run_seconds, 1),

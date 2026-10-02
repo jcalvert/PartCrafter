@@ -95,27 +95,47 @@ def find_mesh_grid_coordinates_fast_gpu(
 def find_candidates_band(
     occupancy_grid: torch.Tensor, 
     band_threshold: float, 
-    n_limits: int = -1
+    n_limits: int = -1,
+    band_mode: str = "legacy",
 ) -> torch.Tensor:
     """
-    Returns the coordinates of all voxels in the occupancy_grid where |value| < band_threshold.
+    Select refinement candidates using the legacy sigmoid band or raw logits.
+    Logit mode includes both endpoints of every six-neighbour sign change,
+    including the grid boundary, and evaluates its band in float32.
 
     Args:
-        occupancy_grid (torch.Tensor): A 3D tensor of SDF values.
-        band_threshold (float): The threshold below which |SDF| must be to include the voxel.
+        occupancy_grid (torch.Tensor): A 3D tensor of raw logits.
+        band_threshold (float): Band width, in sigmoid or raw-logit space respectively.
         n_limits (int): Maximum number of points to return (-1 for no limit)
+        band_mode (str): "legacy" or "logit".
 
     Returns:
         torch.Tensor: A 2D tensor of coordinates (N x 3) where each row is [x, y, z].
     """
-    core_grid = occupancy_grid[1:-1, 1:-1, 1:-1]  
-    # logits to sdf
-    core_grid = torch.sigmoid(core_grid) * 2 - 1  
-    # Create a boolean mask for all cells in the band
-    in_band = torch.abs(core_grid) < band_threshold
-
-    # Get coordinates of all voxels in the band
-    core_mesh_coords = torch.nonzero(in_band, as_tuple=False) + 1
+    if band_mode == "legacy":
+        core_grid = occupancy_grid[1:-1, 1:-1, 1:-1]
+        # Preserve the grid's dtype: saturation is part of legacy behaviour.
+        core_grid = torch.sigmoid(core_grid) * 2 - 1
+        in_band = torch.abs(core_grid) < band_threshold
+        core_mesh_coords = torch.nonzero(in_band, as_tuple=False) + 1
+    elif band_mode == "logit":
+        if not np.isfinite(band_threshold) or band_threshold < 0:
+            raise ValueError("band_threshold must be finite and nonnegative")
+        raw = occupancy_grid.float()
+        in_band = raw.abs() < band_threshold
+        for axis in range(3):
+            lower = [slice(None)] * 3
+            upper = [slice(None)] * 3
+            lower[axis] = slice(None, -1)
+            upper[axis] = slice(1, None)
+            lower, upper = tuple(lower), tuple(upper)
+            a, b = raw[lower], raw[upper]
+            changes = ((a <= 0) & (b >= 0)) | ((a >= 0) & (b <= 0))
+            in_band[lower] |= changes
+            in_band[upper] |= changes
+        core_mesh_coords = torch.nonzero(in_band, as_tuple=False)
+    else:
+        raise ValueError("band_mode must be 'legacy' or 'logit'")
 
     if n_limits != -1 and core_mesh_coords.shape[0] > n_limits:
         print(f"core mesh coords {core_mesh_coords.shape[0]} is too large, limited to {n_limits}")
@@ -169,6 +189,7 @@ def hierarchical_extract_geometry(
     max_num_expanded_coords: int = 1e8, 
     verbose: bool = False,
     band_mode: str = "legacy",
+    band_threshold: float = 0.95,
 ):
     """
     Args:
@@ -177,14 +198,19 @@ def hierarchical_extract_geometry(
         bounds:
         dense_octree_depth:
         hierarchical_octree_depth:
+        band_mode: "legacy" preserves the sigmoid band at width 1.0;
+            "logit" uses the fp32 raw-logit band plus sign changes (changes quality).
+        band_threshold: Raw-logit band width; used only in "logit" mode.
     Returns:
         (vertices, faces), or (vertices, faces, stats) when verbose=True.
         Each stats entry records the depth, raw candidates, expanded coordinates,
         and coordinates queried. The dense level queries all grid coordinates.
     """
     LAST_EXTRACTION_STATS.clear()
-    if band_mode != "legacy":
-        raise ValueError("band_mode must be 'legacy'")
+    if band_mode not in ("legacy", "logit"):
+        raise ValueError("band_mode must be 'legacy' or 'logit'")
+    if band_mode == "logit" and (not np.isfinite(band_threshold) or band_threshold < 0):
+        raise ValueError("band_threshold must be finite and nonnegative")
     if isinstance(bounds, float):
         bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
@@ -214,8 +240,9 @@ def hierarchical_extract_geometry(
         # upsample
         grid_size = 2**curr_octree_depth
         normalize_offset = grid_size / 2
-        band_threshold = 1.0
-        edge_coords = find_candidates_band(grid_logits, band_threshold)
+        edge_coords = find_candidates_band(
+            grid_logits, 1.0 if band_mode == "legacy" else band_threshold, band_mode=band_mode
+        )
         level_stats = {"octree_depth": curr_octree_depth, "raw_candidates": len(edge_coords),
                        "expanded_coords": 0, "queried_coords": 0}
         LAST_EXTRACTION_STATS.append(level_stats)

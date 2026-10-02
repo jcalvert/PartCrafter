@@ -202,11 +202,14 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         return_dict: bool = True,
         decode_chunk_size: int = 50000,
         band_mode: str = "legacy",
+        band_threshold: float = 0.95,
     ):
         if decode_chunk_size <= 0:
             raise ValueError("decode_chunk_size must be positive")
-        if band_mode != "legacy":
-            raise ValueError("band_mode must be 'legacy'")
+        if band_mode not in ("legacy", "logit"):
+            raise ValueError("band_mode must be 'legacy' or 'logit'")
+        if band_mode == "logit" and (not math.isfinite(band_threshold) or band_threshold < 0):
+            raise ValueError("band_threshold must be finite and nonnegative")
 
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -359,6 +362,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         hierarchical_octree_depth=hierarchical_octree_depth,
                         max_num_expanded_coords=max_num_expanded_coords,
                         band_mode=band_mode,
+                        band_threshold=band_threshold,
                         # verbose=True
                     )
                     mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])

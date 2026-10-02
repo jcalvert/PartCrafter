@@ -77,6 +77,12 @@ The generated results will be saved to `./results/robot`. We provide several exa
 
 Specify `--rmbg` if you use custom images. **This will remove the background of the input image and resize it appropriately.**
 
+Selective refinement is an explicit quality-changing option: add
+`--band_mode logit --band_threshold 0.95`. It selects an fp32 raw-logit band
+plus six-neighbour sign changes before dilation. Marching cubes uses raw logits
+at level zero. The default `--band_mode legacy` preserves the original sigmoid
+band at width 1.0 in the grid's dtype and ignores `--band_threshold`.
+
 ### VLM-Based Part Suggestion
 Instead of manually specifying `--num_parts`, you can use a VLM to automatically suggest the number of parts:
 ```
